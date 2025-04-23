@@ -1,10 +1,12 @@
 import numpy as np
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict
+import time
 
 class GomokuEngine:
     """
     A lightweight Gomoku (Five in a Row) engine optimized for low resource usage.
-    Uses heuristic-based approach instead of deep tree search to suggest moves.
+    Uses heuristic-based approach with opening book strategies to suggest moves.
+    Inspired by the winning strategy from https://github.com/fucusy/gomoku-first-move-always-win
     """
 
     def __init__(self, board_size: int = 15):
@@ -13,6 +15,28 @@ class GomokuEngine:
         self.empty = 0
         self.black = 1  # Player 1
         self.white = 2  # Player 2
+
+        # Opening book for black (first player)
+        # Key: board state as string, Value: best move as (row, col)
+        self.opening_book = self._initialize_opening_book()
+
+        # Threat patterns and their scores
+        self.threat_patterns = {
+            # Five in a row (win)
+            'five': 100000,
+            # Open four (one move away from winning)
+            'open_four': 10000,
+            # Closed four (can be blocked)
+            'closed_four': 5000,
+            # Open three (can lead to open four)
+            'open_three': 1000,
+            # Closed three (can be blocked)
+            'closed_three': 500,
+            # Open two
+            'open_two': 100,
+            # Closed two
+            'closed_two': 50
+        }
 
     @property
     def board_size(self) -> int:
@@ -23,6 +47,53 @@ class GomokuEngine:
     def board_size(self, size: int):
         """Set the board size."""
         self._board_size = size
+
+    def _initialize_opening_book(self) -> Dict[str, Tuple[int, int]]:
+        """
+        Initialize the opening book with known good first moves and responses.
+        This is a simplified version of the opening book from the winning strategy.
+        """
+        book = {}
+
+        # Empty board - start in the center
+        book[self._board_to_string(np.zeros((15, 15), dtype=np.int8))] = (7, 7)
+
+        # Common opening patterns and responses
+        # These are based on proven winning strategies for black
+
+        # If white plays adjacent to center, black should play on the opposite side
+        center = 7
+        for dr, dc in [(0, 1), (1, 0), (1, 1), (1, -1)]:
+            board = np.zeros((15, 15), dtype=np.int8)
+            board[center, center] = self.black  # Black plays center
+            board[center + dr, center + dc] = self.white  # White plays adjacent
+            book[self._board_to_string(board)] = (center - dr, center - dc)  # Black plays opposite
+
+        # If white plays two steps away, black should play between
+        for dr, dc in [(0, 2), (2, 0), (2, 2), (2, -2)]:
+            board = np.zeros((15, 15), dtype=np.int8)
+            board[center, center] = self.black  # Black plays center
+            board[center + dr, center + dc] = self.white  # White plays two steps away
+            book[self._board_to_string(board)] = (center + dr//2, center + dc//2)  # Black plays between
+
+        return book
+
+    def _board_to_string(self, board: np.ndarray) -> str:
+        """
+        Convert a board state to a string representation for the opening book.
+        Only includes positions that have stones to keep the representation compact.
+        """
+        positions = []
+        black_positions = np.where(board == self.black)
+        white_positions = np.where(board == self.white)
+
+        for r, c in zip(black_positions[0], black_positions[1]):
+            positions.append(f"B{r},{c}")
+
+        for r, c in zip(white_positions[0], white_positions[1]):
+            positions.append(f"W{r},{c}")
+
+        return "_".join(sorted(positions))
 
     def get_best_move(self, board: List[List[int]], player: int) -> Tuple[int, int]:
         """
@@ -35,14 +106,26 @@ class GomokuEngine:
         Returns:
             Tuple of (row, col) for the best move
         """
+        start_time = time.time()
+
         # Convert board to numpy array for efficiency
         board_array = np.array(board, dtype=np.int8)
 
+        # Check opening book first
+        board_str = self._board_to_string(board_array)
+        if board_str in self.opening_book:
+            return self.opening_book[board_str]
+
         # If board is empty or nearly empty, play near the center
         stone_count = np.count_nonzero(board_array)
-        if stone_count <= 1:
+        if stone_count == 0:
             center = self.board_size // 2
             return (center, center)
+
+        # Check for immediate winning moves or blocking opponent's winning moves
+        immediate_move = self._check_immediate_threats(board_array, player)
+        if immediate_move:
+            return immediate_move
 
         # Get all valid moves (empty cells)
         valid_moves = self._get_valid_moves(board_array)
@@ -59,7 +142,45 @@ class GomokuEngine:
 
         # Return the move with the highest score
         best_move = max(move_scores.items(), key=lambda x: x[1])[0]
+
+        # Print time taken for debugging (can be removed in production)
+        elapsed = time.time() - start_time
+        print(f"Move calculation took {elapsed:.3f} seconds")
+
         return best_move
+
+    def _check_immediate_threats(self, board: np.ndarray, player: int) -> Optional[Tuple[int, int]]:
+        """
+        Check for immediate winning moves or blocking opponent's winning moves.
+        """
+        opponent = 3 - player  # Switch between 1 and 2
+
+        # Get all valid moves
+        valid_moves = self._get_valid_moves(board)
+
+        # First check if we can win in one move
+        for move in valid_moves:
+            row, col = move
+            test_board = board.copy()
+            test_board[row, col] = player
+
+            # Check if this move creates a winning line
+            for dr, dc in [(1, 0), (0, 1), (1, 1), (1, -1)]:
+                if self._check_line(test_board, row, col, dr, dc, player, 5):
+                    return move
+
+        # Then check if we need to block opponent's winning move
+        for move in valid_moves:
+            row, col = move
+            test_board = board.copy()
+            test_board[row, col] = opponent
+
+            # Check if opponent would win with this move
+            for dr, dc in [(1, 0), (0, 1), (1, 1), (1, -1)]:
+                if self._check_line(test_board, row, col, dr, dc, opponent, 5):
+                    return move
+
+        return None
 
     def _get_valid_moves(self, board: np.ndarray) -> List[Tuple[int, int]]:
         """Get all valid moves (empty cells) on the board."""
@@ -100,7 +221,7 @@ class GomokuEngine:
         # Initialize score
         score = 0.0
 
-        # Check all 8 directions
+        # Check all 4 directions
         directions = [
             (1, 0),   # Vertical
             (0, 1),   # Horizontal
@@ -112,13 +233,13 @@ class GomokuEngine:
         for dr, dc in directions:
             # Check if this move creates a winning line
             if self._check_line(test_board, row, col, dr, dc, player, 5):
-                return 10000  # Immediate win
+                return self.threat_patterns['five']  # Immediate win
 
         # Check for blocking opponent's winning move
         test_board[row, col] = opponent
         for dr, dc in directions:
             if self._check_line(test_board, row, col, dr, dc, opponent, 5):
-                score += 5000  # High priority to block
+                score += self.threat_patterns['five'] * 0.9  # High priority to block
 
         # Reset the test board
         test_board[row, col] = player
@@ -126,17 +247,44 @@ class GomokuEngine:
         # Check for creating open fours (four in a row with empty spaces at both ends)
         for dr, dc in directions:
             if self._check_open_line(test_board, row, col, dr, dc, player, 4):
-                score += 1000
+                score += self.threat_patterns['open_four']
+            elif self._check_line(test_board, row, col, dr, dc, player, 4):
+                score += self.threat_patterns['closed_four']
 
         # Check for creating open threes
         for dr, dc in directions:
             if self._check_open_line(test_board, row, col, dr, dc, player, 3):
-                score += 100
+                score += self.threat_patterns['open_three']
+            elif self._check_line(test_board, row, col, dr, dc, player, 3):
+                score += self.threat_patterns['closed_three']
 
         # Check for creating open twos
         for dr, dc in directions:
             if self._check_open_line(test_board, row, col, dr, dc, player, 2):
-                score += 10
+                score += self.threat_patterns['open_two']
+            elif self._check_line(test_board, row, col, dr, dc, player, 2):
+                score += self.threat_patterns['closed_two']
+
+        # Check for blocking opponent's threats
+        test_board[row, col] = opponent
+
+        # Block opponent's open fours
+        for dr, dc in directions:
+            if self._check_open_line(test_board, row, col, dr, dc, opponent, 4):
+                score += self.threat_patterns['open_four'] * 0.8
+            elif self._check_line(test_board, row, col, dr, dc, opponent, 4):
+                score += self.threat_patterns['closed_four'] * 0.8
+
+        # Block opponent's open threes
+        for dr, dc in directions:
+            if self._check_open_line(test_board, row, col, dr, dc, opponent, 3):
+                score += self.threat_patterns['open_three'] * 0.7
+
+        # Prefer center and central areas
+        center = self.board_size // 2
+        distance_to_center = abs(row - center) + abs(col - center)
+        centrality_score = max(0, 10 - distance_to_center) * 10
+        score += centrality_score
 
         # Add a small random factor to break ties
         score += np.random.random() * 0.1
